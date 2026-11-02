@@ -62,7 +62,10 @@ def score_result(conn, result_id: str, review_id: str) -> None:
 
     o = OUTCOME_VALUE[outcome]
     p_design = exp["body"]["predicted_probability"]
-    award(conn, exp["author"], "testing", calibration(p_design, o),
+    # In-silico tests count half: a model only shows what its own assumptions imply,
+    # and its outcome is easier to foresee after exploratory runs.
+    w = 0.5 if exp["body"].get("simulation") else 1.0
+    award(conn, exp["author"], "testing", w * calibration(p_design, o),
           f"calibration of predicted p={p_design} vs outcome={outcome}", exp["id"], f"{key}:designer")
 
     # Hypothesis author: a proper scoring rule on their own prior (honesty pays),
@@ -76,8 +79,10 @@ def score_result(conn, result_id: str, review_id: str) -> None:
     else:
         hyp_reward += 0.2
         reason = f"hypothesis cleanly refuted (prior {prior})"
-    award(conn, hyp["author"], "testing", hyp_reward, reason, hyp["id"], f"{key}:hypothesis")
-    blackboard.set_status(conn, hyp["id"], outcome if verdict == "replicated" else f"{outcome}_unreplicated")
+    award(conn, hyp["author"], "testing", w * hyp_reward, reason + (" [in silico x0.5]" if w < 1 else ""),
+          hyp["id"], f"{key}:hypothesis")
+    status = outcome if verdict == "replicated" else f"{outcome}_unreplicated"
+    blackboard.set_status(conn, hyp["id"], f"{status}_in_silico" if w < 1 else status)
 
     # Upstream credit: authors of the findings/datasets the hypothesis built on.
     for cited in hyp["cites"]:

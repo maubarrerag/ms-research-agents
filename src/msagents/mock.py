@@ -41,6 +41,17 @@ print("SUPPORTED" if (d >= 0.5 and p < 0.001) else "REFUTED")
 '''
 
 
+SIM_SPEC = {"model": "eae_mouse", "n_per_arm": 20, "seed": 1, "arms": [
+    {"name": "vehicle"},
+    {"name": "BTKi from day 12", "interventions": [{"name": "btk_inhibitor", "start_day": 12}]}]}
+
+
+def sim_outcome(out: dict) -> tuple[str, str]:
+    c = out["comparisons"][0]["final_score"]
+    ok = c["diff"] is not None and c["diff"] <= -0.3 and (c.get("p_welch") or 1) < 0.01
+    return ("supported" if ok else "refuted"), f"final_score diff={c['diff']}, d={c.get('cohen_d')}, p={c.get('p_welch')}"
+
+
 def _tu(tool_name, **inp):
     return {"type": "tool_use", "id": f"toolu_mock_{uuid.uuid4().hex[:16]}", "name": tool_name, "input": inp}
 
@@ -115,8 +126,48 @@ class MockLLM:
                         cites=ids)]
         return self._done("Proposed one hypothesis.")
 
+    def _systems_biologist(self, turn, refs, prev, ctx):
+        if turn == 0:
+            return [_tu("describe_model")]
+        if turn == 1:
+            return [_tu("run_simulation", spec=SIM_SPEC)]
+        if turn == 2:
+            return [_tu("add_mechanism", title="Microglial BTK signalling sustains CNS inflammation after onset",
+                        summary="Once T cells have entered the CNS, activated microglia re-present myelin antigen "
+                                "and keep the attack going; BTK sits in microglial activation pathways.",
+                        causal_chain=[
+                            {"cause": "CNS T cells", "effect": "microglial activation", "relation": "increases",
+                             "basis": "established"},
+                            {"cause": "BTK signalling", "effect": "microglial activation", "relation": "required_for",
+                             "basis": "inferred", "note": "BTK is expressed in microglia (mock data: check)"},
+                            {"cause": "activated microglia", "effect": "T cell re-activation in CNS",
+                             "relation": "increases", "basis": "inferred"},
+                            {"cause": "T cells x microglia", "effect": "demyelination", "relation": "increases",
+                             "basis": "established"}],
+                        predictions=["A CNS-penetrant BTK inhibitor started after onset still lowers disability"],
+                        gaps="Size of the microglial (vs B cell) contribution is unknown.")]
+        if turn == 3:
+            cid = json.loads(prev[0])["id"]
+            return [_tu("propose_hypothesis", basis="mechanistic",
+                        statement="Starting a BTK inhibitor after EAE onset still reduces later disability",
+                        mechanism="BTK blockade dampens microglial activation that sustains CNS inflammation",
+                        rationale="Mechanism map " + cid + "; exploratory simulation showed a large effect",
+                        prior_probability=0.6,
+                        testable_prediction="in silico: eae_mouse, BTKi from day 12, final_score lower by >= 0.3",
+                        cites=[cid])]
+        return self._done("Mapped mechanism and proposed a mechanistic hypothesis.")
+
     def _experiment_designer(self, turn, refs, prev, ctx):
         if turn == 0:
+            return [_tu("get_artifact", id=refs[0])]
+        if turn == 1:
+            hyp = json.loads(prev[0])
+            if hyp["body"].get("basis") == "mechanistic":
+                return [_tu("preregister_experiment", hypothesis_id=refs[0], method="in-silico RCT, Welch t-test",
+                            dataset="in_silico:eae_mouse", prediction="final_score lower with BTKi from day 12",
+                            success_criteria="arm 1 vs control: final_score diff <= -0.3 and p_welch < 0.01",
+                            predicted_probability=0.7, simulation=SIM_SPEC,
+                            analysis_plan="Run the locked spec; compare final_score arm 1 vs arm 0.")]
             return [_tu("preregister_experiment", hypothesis_id=refs[0], method="Welch t-test",
                         dataset="datasets/synthetic_ms_cohort.csv",
                         prediction="anti_ebna1 higher in ms_case=1",
@@ -127,14 +178,24 @@ class MockLLM:
 
     def _analyst(self, turn, refs, prev, ctx):
         if turn == 0:
-            return [_tu("get_artifact", id=refs[0]), _tu("run_analysis", code=TEST_CODE)]
+            return [_tu("get_artifact", id=refs[0])]
         if turn == 1:
-            out = json.loads(prev[1])
-            outcome = "supported" if "SUPPORTED" in out["stdout"] else "refuted"
-            return [_tu("record_result", experiment_id=refs[0], outcome=outcome,
-                        statistics=out["stdout"].splitlines()[0], summary="Ran the locked plan exactly.",
-                        code_path=out["script_path"], deviations=[])]
+            exp = json.loads(prev[0])
+            ctx.scratch["sim"] = bool(exp["body"].get("simulation"))
+            if ctx.scratch["sim"]:
+                return [_tu("run_simulation", experiment_id=refs[0])]
+            return [_tu("run_analysis", code=TEST_CODE)]
         if turn == 2:
+            out = json.loads(prev[0])
+            if ctx.scratch.get("sim"):
+                outcome, stats = sim_outcome(out)
+                path = out["saved_to"]
+            else:
+                outcome = "supported" if "SUPPORTED" in out["stdout"] else "refuted"
+                stats, path = out["stdout"].splitlines()[0], out["script_path"]
+            return [_tu("record_result", experiment_id=refs[0], outcome=outcome, statistics=stats,
+                        summary="Ran the locked plan exactly.", code_path=path, deviations=[])]
+        if turn == 3:
             rid = json.loads(prev[0])["id"]
             return [_tu("send_message", to="role:critic", kind="request", subject=f"Please replicate {rid}",
                         body=f"Script path is in {rid}. It runs in <1s.", refs=[rid])]
@@ -147,14 +208,25 @@ class MockLLM:
             ctx.scratch["inbox"] = json.loads(prev[0])
             result = json.loads(prev[1])
             ctx.scratch["orig"] = result["body"]["outcome"]
+            if result["body"]["code_path"].endswith(".json"):
+                ctx.scratch["sim"] = True
+                eid = result["body"]["experiment_id"]
+                return [_tu("run_simulation", experiment_id=eid), _tu("run_simulation", experiment_id=eid, seed=99)]
             return [_tu("run_analysis", script_path=result["body"]["code_path"])]
         if turn == 2:
-            out = json.loads(prev[0])
-            got = "supported" if "SUPPORTED" in out["stdout"] else "refuted"
-            orig = ctx.scratch.get("orig", got)
-            verdict = "replicated" if got == orig else "flawed"
-            blocks = [_tu("review", target_id=refs[0], verdict=verdict, replicated_outcome=got,
-                          comments=f"Re-ran script: {out['stdout'].splitlines()[0]}. Data is SYNTHETIC.")]
+            if ctx.scratch.get("sim"):
+                got, stats = sim_outcome(json.loads(prev[0]))
+                other, stats2 = sim_outcome(json.loads(prev[1]))
+                orig = ctx.scratch["orig"]
+                verdict = "replicated" if got == orig == other else ("valid" if got == orig else "flawed")
+                comments = f"Locked seed: {stats}. Seed 99: {stats2}. Outcome {'stable' if got == other else 'NOT stable'} across seeds."
+            else:
+                out = json.loads(prev[0])
+                got = "supported" if "SUPPORTED" in out["stdout"] else "refuted"
+                orig = ctx.scratch.get("orig", got)
+                verdict = "replicated" if got == orig else "flawed"
+                comments = f"Re-ran script: {out['stdout'].splitlines()[0]}. Data is SYNTHETIC."
+            blocks = [_tu("review", target_id=refs[0], verdict=verdict, replicated_outcome=got, comments=comments)]
             for m in ctx.scratch.get("inbox", []):
                 blocks.append(_tu("rate_message", message_id=m["id"], rating=0.9))
                 if m["kind"] == "request":

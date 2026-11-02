@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from . import blackboard, bus, memory, rewards, sandbox, tasks
+from . import blackboard, bus, memory, rewards, sandbox, simulator, tasks
 from .db import DATA_DIR
 from .sources import europepmc
 
@@ -205,13 +205,78 @@ def run_analysis(ctx: Ctx, code=None, script_path=None):
     return sandbox.run_python(code, script_path, save_as)
 
 
+# ---- mechanistic reasoning and the virtual mouse / patient -----------------
+
+@tool("describe_model",
+      "Describe the in-silico MS models (virtual EAE mouse, cuprizone mouse, virtual patient): their "
+      "state variables, every parameter and what biology it stands for, available drugs/conditions and "
+      "their mechanism, and the simulation spec format. Read this before designing a simulation.", {}, [])
+def describe_model(ctx: Ctx):
+    return simulator.describe()
+
+
+SIM_SPEC = {"type": "object", "description":
+            "Simulation spec: {model, n_per_arm, days?, seed, arms:[{name, interventions:[{name, dose, "
+            "start_day, stop_day} | {name:'custom', effects:{param: multiplier}, start_day}], conditions:[...], "
+            "param_overrides:{param: multiplier}}], cohort_conditions:[...]}. Arm 0 is the control. "
+            "See describe_model."}
+
+
+@tool("run_simulation",
+      "Run an experiment on virtual animals or patients (mechanistic ODE model with between-subject "
+      "variability). Give experiment_id to run a pre-registered in-silico experiment exactly as locked "
+      "(optionally with a different seed to check robustness), or spec for an exploratory run. "
+      "Exploratory runs are for building intuition and are labelled as such; they never count as tests. "
+      "Returns per-arm means/SDs, each arm vs control (difference, Cohen's d, Welch p) and short curves.",
+      {"experiment_id": S, "spec": SIM_SPEC, "seed": {"type": "integer"}}, [])
+def run_simulation(ctx: Ctx, experiment_id=None, spec=None, seed=None):
+    if experiment_id:
+        exp = blackboard.get(ctx.conn, experiment_id)
+        if not exp or exp["kind"] != "experiment" or not exp["body"].get("simulation"):
+            raise ValueError(f"{experiment_id} is not a pre-registered in-silico experiment")
+        spec, purpose = dict(exp["body"]["simulation"]), "preregistered"
+    elif spec:
+        purpose = "exploratory"
+    else:
+        raise ValueError("give experiment_id or spec")
+    if seed is not None:
+        spec = {**spec, "seed": int(seed)}
+    res = simulator.run(spec)
+    rel = f"simulations/{ctx.agent}/task{ctx.task_id}/{purpose}-{res['spec_hash']}-seed{res['spec']['seed']}.json"
+    path = sandbox.safe_path(rel)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({**res, "purpose": purpose, "experiment_id": experiment_id}, indent=1))
+    step = max(1, len(next(iter(res["curves"].values()))["day"]) // 12)
+    short = {arm: {k: v[::step] for k, v in c.items()} for arm, c in res["curves"].items()}
+    return {"purpose": purpose, "experiment_id": experiment_id, "saved_to": rel, "model": res["model"],
+            "spec_hash": res["spec_hash"], "seed": res["spec"]["seed"], "summary": res["summary"],
+            "comparisons": res["comparisons"], "curves": short, "note": res["note"]}
+
+
+@tool("add_mechanism",
+      "Record a causal mechanism map reasoned from how the body and the disease work (immunology, "
+      "neurobiology, physiology, pharmacology). causal_chain is a list of links "
+      "{cause, effect, relation: increases|decreases|required_for|blocks, basis: "
+      "established|literature|inferred|speculative, source (PMID/DOI/F-id, required for 'literature'), note}. "
+      "predictions: what the chain implies that could be checked. gaps: weakest or untested links.",
+      {"title": S, "summary": S,
+       "causal_chain": {"type": "array", "items": {"type": "object"}},
+       "predictions": LIST_S, "gaps": S, "cites": LIST_S},
+      ["title", "summary", "causal_chain", "predictions"])
+def add_mechanism(ctx: Ctx, **kw):
+    return {"id": blackboard.add_mechanism(ctx.conn, ctx.agent, **kw)}
+
+
 # ---- scientific pipeline ---------------------------------------------------
 
 @tool("propose_hypothesis",
-      "Propose a testable hypothesis about MS cause or treatment. Must cite findings/datasets. "
-      "prior_probability = your honest chance it is true (0.01-0.99).",
+      "Propose a testable hypothesis about MS cause or treatment. Must cite findings, datasets or mechanism "
+      "maps (C*). basis: literature (from papers), mechanistic (reasoned from physiology/immunology, may be "
+      "new), data, or mixed. prior_probability = your honest chance it is true (0.01-0.99). If it can be "
+      "tested in the virtual mouse/patient, say how in testable_prediction.",
       {"statement": S, "mechanism": S, "rationale": S, "prior_probability": N,
-       "testable_prediction": S, "cites": LIST_S},
+       "testable_prediction": S, "cites": LIST_S,
+       "basis": {"type": "string", "enum": list(blackboard.BASIS)}},
       ["statement", "mechanism", "rationale", "prior_probability", "testable_prediction", "cites"])
 def propose_hypothesis(ctx: Ctx, **kw):
     return {"id": blackboard.propose_hypothesis(ctx.conn, ctx.agent, **kw)}
@@ -219,10 +284,12 @@ def propose_hypothesis(ctx: Ctx, **kw):
 
 @tool("preregister_experiment",
       "Lock a test plan BEFORE any analysis. After this it cannot be edited. predicted_probability = "
-      "your honest chance the success criteria will be met. You are scored on calibration.",
+      "your honest chance the success criteria will be met. You are scored on calibration. For an "
+      "in-silico test, put the full simulation spec in `simulation` (see describe_model) and give success "
+      "criteria in terms of its metrics, e.g. 'arm 1 vs control: peak_score diff <= -0.5 and p_welch < 0.01'.",
       {"hypothesis_id": S, "method": S, "dataset": {"type": "string", "description": "dataset id or path"},
        "prediction": S, "success_criteria": {"type": "string", "description": "exact statistic and threshold"},
-       "predicted_probability": N, "analysis_plan": S, "cites": LIST_S},
+       "predicted_probability": N, "analysis_plan": S, "cites": LIST_S, "simulation": SIM_SPEC},
       ["hypothesis_id", "method", "dataset", "prediction", "success_criteria", "predicted_probability", "analysis_plan"])
 def preregister_experiment(ctx: Ctx, **kw):
     return {"id": blackboard.preregister_experiment(ctx.conn, ctx.agent, **kw)}

@@ -2,10 +2,26 @@
 # Each role becomes `count` agent processes named <role>-<n>.
 
 defaults:
-  model: claude-opus-5-5
+  # Which model backend every agent uses. Override per run with
+  # `msagents run --backend claude_code` (or env MSAGENTS_BACKEND).
+  #   anthropic    Claude API, needs ANTHROPIC_API_KEY (best quality, prompt caching)
+  #   claude_code  your Claude Pro/Max login via the `claude` CLI (no API key; Pro usage limits apply)
+  #   litellm      any LiteLLM model: local Ollama, OpenAI, Gemini, OpenRouter... (see backends.litellm)
+  backend: anthropic
+  model: claude-opus-5-5   # model for the anthropic backend
   effort: high          # low | medium | high | xhigh | max
   max_steps: 40         # model turns per task before it is stopped
   max_tokens: 16000
+
+backends:
+  claude_code:
+    model: sonnet        # sonnet | opus | haiku (Pro: sonnet stretches your usage limit furthest)
+    max_parallel: 2      # simultaneous `claude -p` calls across all agents
+    timeout: 900         # seconds per model turn
+  litellm:
+    model: ollama_chat/qwen3:14b   # must support tool calling; e.g. openai/gpt-5-mini, gemini/gemini-2.5-flash
+    # api_base: http://localhost:11434
+    # temperature: 0.3
 
 mission: |
   You are part of an autonomous research team investigating the causes of
@@ -23,6 +39,14 @@ mission: |
     and rigor, not on how many things come out "positive".
   - Correlation in observational data is not causation; say which causal
     method (Mendelian randomization, longitudinal design, etc.) supports a claim.
+  - Papers are one source of ideas; physiology is another. Reason from how
+    the immune system, the blood-brain barrier, myelin, oligodendrocytes,
+    microglia and neurons work to find links nobody has tested yet. Label
+    every step: established, literature (with source), inferred, or speculative.
+  - The virtual mouse / virtual patient (run_simulation) shows what a
+    mechanism implies under the model's assumptions. Use it to sharpen or
+    kill ideas cheaply; never present an in-silico result as evidence about
+    real patients.
   - This is computational research support. Nothing you produce is medical
     advice; clinical relevance requires human experts and trials.
 
@@ -75,16 +99,46 @@ roles:
       register each with add_dataset including its variables. Note licence
       and sample size. Answer data requests from other agents.
 
+  systems_biologist:
+    count: 1
+    effort: high
+    tools: [describe_model, run_simulation, add_mechanism, propose_hypothesis, search_literature]
+    prompt: |
+      You reason from first principles about how MS works in the human body:
+      antigen presentation and T/B cell priming in lymph nodes, EBV latency and
+      molecular mimicry, trafficking across the blood-brain barrier, microglial
+      activation, demyelination, OPC differentiation and remyelination, axonal
+      energy failure and neurodegeneration, and the pharmacology of drugs.
+      For your topic:
+      1. Write the causal chain step by step and record it with add_mechanism.
+         Label each link established / literature (with source) / inferred /
+         speculative. Use search_literature only to check specific links.
+      2. Look for places the chain predicts something non-obvious: a missing
+         link, a timing effect (preventive vs therapeutic), a combination that
+         should synergise, a risk factor that should interact with another,
+         or a drug that should work for an unexpected reason.
+      3. Read describe_model, then run a few exploratory simulations to see
+         whether the mechanism, as encoded, produces the effect. Use 'custom'
+         interventions or param_overrides to encode a new mechanism. Check
+         robustness with a second seed. Remember the model's limits.
+      4. Propose 1-2 hypotheses (basis 'mechanistic' or 'mixed') that cite your
+         mechanism map and say how to test them in silico AND what real data
+         or experiment would test them for real.
+
   hypothesis_generator:
     count: 1
     effort: high
-    tools: [propose_hypothesis]
+    tools: [propose_hypothesis, describe_model]
     prompt: |
-      You generate hypotheses. Read the recent findings and datasets, look for
-      mechanisms that connect them, and propose 1-3 hypotheses that can be
-      tested with data the team has or can get. Give an honest prior
-      probability. Avoid restating well-established facts; aim for the
-      next informative question.
+      You generate hypotheses. Read the recent findings (F*), datasets (D*)
+      and mechanism maps (C*). Combine what the literature shows with what
+      physiology implies: ask "if this finding is true, what else must be
+      true in the body?" and "which step of this mechanism has nobody
+      tested?". Propose 1-3 hypotheses that can be tested with data the team
+      has or can get, or in the virtual mouse/patient. Set basis honestly
+      (literature / mechanistic / data / mixed) and give an honest prior.
+      Avoid restating well-established facts; aim for the next informative
+      question.
 
   experiment_designer:
     count: 1
@@ -95,27 +149,36 @@ roles:
       a method that could clearly refute it, define the exact statistic and
       threshold for success, and pre-register the plan. State your honest
       probability that the success criteria will be met: you are rewarded
-      for calibration. If no suitable data exists, ask the data curator
-      (send_message kind=request) and stop.
+      for calibration.
+      If the hypothesis is mechanistic and can be expressed in the virtual
+      mouse or patient (describe_model), design an in-silico experiment:
+      put the full spec in `simulation`, include a control arm, enough
+      virtual subjects (>= 20 per arm), and criteria on the model's metrics.
+      Prefer a real-data test when one exists; in-silico tests earn half the
+      reward. If no suitable data exists and it can't be simulated, ask the
+      data curator (send_message kind=request) and stop.
 
   analyst:
     count: 1
     effort: high
-    tools: [inspect_file, run_analysis, record_result]
+    tools: [inspect_file, run_analysis, run_simulation, record_result]
     prompt: |
       You run pre-registered experiments. Read the locked plan, write the
       analysis code, run it, and record the outcome exactly as the success
-      criteria define it. List every deviation from the plan. Then ask the
+      criteria define it. For in-silico experiments call
+      run_simulation(experiment_id=...) and use its saved_to path as code_path. List every deviation from the plan. Then ask the
       critic to replicate (send_message to role:critic, kind=request).
 
   critic:
     count: 1
     effort: high
-    tools: [inspect_file, run_analysis, review]
+    tools: [inspect_file, run_analysis, run_simulation, review]
     prompt: |
       You are the independent reviewer. For the result in your task, compare
       it to the pre-registered plan, re-run the script (run_analysis with
       script_path), look for bugs, leakage, confounding and multiple-testing
-      problems, and give a verdict. Your reward does not depend on which
+      problems, and give a verdict. For in-silico results, re-run
+      run_simulation(experiment_id=...) with the locked seed AND one other
+      seed: if the outcome flips with the seed, the result is not robust. Your reward does not depend on which
       verdict you give, only on doing the review well. Rate the messages you
       received and reply to requests.

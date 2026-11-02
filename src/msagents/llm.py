@@ -117,18 +117,19 @@ def render_transcript(messages: list) -> str:
 
 PROTOCOL = """\
 # How you act in this session
-You are running inside an automated research harness, not a chat. You cannot
-call tools directly. Instead, every reply is a JSON object (enforced by the
-output schema) with:
+You are running inside an automated research harness, not a chat. The tools
+listed below are NOT callable by you directly, and must never be invoked as
+tool calls. Your only action is to give your structured output (the
+StructuredOutput tool / JSON reply), once per turn, with:
   "text":       short reasoning or a note for the record (may be empty)
   "tool_calls": the tools you want the harness to run now, in order, each
                 {"name": <tool name>, "input": {...arguments...}}
 The harness runs them and shows you the results in the next turn as
 [tool_result for <id>] blocks. Keep calling tools until the work is done,
 then call complete_task. An empty tool_calls list ends your turn.
-Only use tool names listed below, with arguments that match their schemas.
+Only use action names listed below, with arguments that match their schemas.
 
-# Tools
+# Actions you can request in "tool_calls" (the harness runs them, not you)
 {tools}
 """
 
@@ -193,13 +194,14 @@ class ClaudeCodeLLM:
         })
 
     def complete(self, system: str, messages: list, tools: list, ctx=None) -> dict:
-        sys_prompt = system + "\n\n" + PROTOCOL.replace("{tools}", render_tools(tools))
+        sys_prompt = system + ("\n\n" + PROTOCOL.replace("{tools}", render_tools(tools)) if tools else "")
         prompt = render_transcript(messages) + "\n\n=== YOUR NEXT REPLY (JSON) ==="
         if len(sys_prompt) > 100_000:            # keep argv small; move it into stdin
             prompt, sys_prompt = sys_prompt + "\n\n" + prompt, "Follow the instructions in the input."
         cmd = [self.cli, "-p", "--output-format", "json", "--tools", "", "--strict-mcp-config",
-               "--no-session-persistence", "--model", self.model, "--system-prompt", sys_prompt,
-               "--json-schema", self._schema(tools)]
+               "--no-session-persistence", "--model", self.model, "--system-prompt", sys_prompt]
+        if tools:
+            cmd += ["--json-schema", self._schema(tools)]
         if self.effort:
             cmd += ["--effort", self.effort]
         env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
@@ -239,6 +241,8 @@ class ClaudeCodeLLM:
     @staticmethod
     def _parse(out: dict) -> dict:
         data = out.get("structured_output")
+        if data is None and "tool_calls" not in (out.get("result") or ""):
+            data = {"text": out.get("result") or "", "tool_calls": []}   # plain-text turn (no tools)
         if data is None:
             raw = out.get("result") or ""
             m = re.search(r"\{.*\}", raw, re.S)
@@ -307,7 +311,9 @@ class LiteLLM:
 
     def complete(self, system: str, messages: list, tools: list, ctx=None) -> dict:
         kw = dict(model=self.model, messages=to_openai_messages(system, messages),
-                  tools=to_openai_tools(tools), max_tokens=self.max_tokens, num_retries=4, **self.extra)
+                  max_tokens=self.max_tokens, num_retries=4, **self.extra)
+        if tools:
+            kw["tools"] = to_openai_tools(tools)
         if self.api_base:
             kw["api_base"] = self.api_base
         if self.temperature is not None:

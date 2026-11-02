@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -511,6 +512,12 @@ def _compare(ctrl: np.ndarray, x: np.ndarray) -> dict:
 def run(spec: dict) -> dict:
     """Run a full in-silico experiment. Returns summary stats, arm-vs-control
     comparisons and a per-day mean trajectory per arm."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)   # nanmean of all-NaN (e.g. onset when nobody got sick)
+        return _run(spec)
+
+
+def _run(spec: dict) -> dict:
     spec = _check_spec(spec)
     model, n, days, seed = spec["model"], spec["n_per_arm"], spec["days"], spec["seed"]
     arm_metrics, curves, summary = [], {}, []
