@@ -21,13 +21,15 @@ flowchart LR
     PI[pi] --- TQ
     LS[literature_scout] -->|findings F| BB
     DC[data_curator] -->|datasets D| BB
+    SB[systems_biologist] -->|mechanism maps C<br/>+ hypotheses| BB
+    SIM[[virtual mouse / patient]] --- SB & ED & AN & CR
     HG[hypothesis_generator] -->|hypotheses H| BB
     ED[experiment_designer] -->|pre-registered E| BB
     AN[analyst] -->|results R| BB
     CR[critic] -->|reviews V| BB
 
-    LS & DC & HG & ED & AN & CR & PI <--> MB
-    LS & DC & HG & ED & AN & CR & PI <--> MEM
+    LS & DC & SB & HG & ED & AN & CR & PI <--> MB
+    LS & DC & SB & HG & ED & AN & CR & PI <--> MEM
     S --> TQ
     BB -->|events create next task| TQ
     BB --> RW --> LED
@@ -46,10 +48,11 @@ concurrent readers and writers from several processes.
 | `pi` | Reviews progress and scores, sets direction | tasks, broadcasts | `view_scores`, `create_task` |
 | `literature_scout` | Reads literature on one agenda topic | **F**indings (claim + PMID + evidence level) | `search_literature` (Europe PMC) |
 | `data_curator` | Finds, downloads, cleans public data | **D**atasets | `download_dataset` (allowlisted hosts), `run_analysis` |
+| `systems_biologist` | Reasons from immunology/physiology, probes ideas in silico | **C** mechanism maps (each link labelled established / literature / inferred / speculative), mechanistic hypotheses | `add_mechanism`, `describe_model`, `run_simulation` |
 | `hypothesis_generator` | Connects findings into testable ideas | **H**ypotheses with honest prior | `propose_hypothesis` |
-| `experiment_designer` | Writes a falsifiable test plan, locks it | **E**xperiments (pre-registered, hashed) | `preregister_experiment` |
-| `analyst` | Runs the locked plan exactly | **R**esults + script path | `run_analysis`, `record_result` |
-| `critic` | Re-runs the script, checks plan vs. result | re**V**iews (replicated / valid / flawed) | `run_analysis`, `review` |
+| `experiment_designer` | Writes a falsifiable test plan (real data or in silico), locks it | **E**xperiments (pre-registered, hashed; simulation spec included) | `preregister_experiment` |
+| `analyst` | Runs the locked plan exactly | **R**esults + script/simulation path | `run_analysis`, `run_simulation`, `record_result` |
+| `critic` | Re-runs the script or simulation (2nd seed), checks plan vs. result | re**V**iews (replicated / valid / flawed) | `run_analysis`, `run_simulation`, `review` |
 
 All agents also get: `read_inbox`, `send_message`, `rate_message`,
 `search_knowledge`, `get_artifact`, `remember`, `recall`, `create_task`,
@@ -162,9 +165,47 @@ sample of reviews, and ratings weighted by the rater's own reliability.
   Run the whole lab inside a container (see README) before giving agents
   real autonomy.
 
+## In-silico experiments
+
+`simulator.py` holds three models built from one set of 13 ODEs
+(periphery: antigen priming, effector T, Treg, B, EBV-infected B; CNS: T,
+Treg, B follicles, microglia, BBB, myelin, oligodendrocytes, axons).
+Drugs and risk factors are parameter modifiers with a time window and dose;
+`custom` modifiers let agents encode a new mechanism. Each arm uses the same
+seed, so arms are paired like littermates; between-subject variation is
+log-normal on 13 key parameters. `face_validity()` checks 10 known effects
+(e.g. natalizumab blocks EAE, clemastine speeds remyelination, aged mice
+remyelinate less, EBV-negative people get less disease) and runs in the tests.
+
+Flow: `run_simulation(spec)` for exploratory runs (never scored) ->
+`preregister_experiment(..., simulation=spec)` locks the spec in the hash ->
+analyst `run_simulation(experiment_id)` -> critic re-runs with the locked
+seed and a new one. In-silico tests pay half the testing reward and set the
+hypothesis status to e.g. `supported_in_silico`.
+
+## Report
+
+`report.py` builds `data/report.md` from the knowledge base with plain code
+(no model), so it cannot invent results: at-a-glance counts, a table of
+hypotheses with where each came from, and for each hypothesis its
+mechanism, evidence (linked PMIDs/DOIs), locked test, result, review and
+virtual-experiment table; mechanism maps as Mermaid diagrams; findings by
+evidence level; failed tasks; scores. `--narrative` adds a clearly marked
+plain-language summary written by the model.
+
 ## Model calls
 
-- `claude-opus-5-5`, adaptive thinking, effort per role in `config/agents.yaml`.
+Backends (`llm.py`) all return Anthropic-format content blocks, so
+checkpoints and resume are backend-independent:
+
+- `anthropic`: `claude-opus-5-5`, adaptive thinking, effort per role in `config/agents.yaml`.
+- `claude_code`: runs `claude -p --output-format json --json-schema ... --tools ""` per turn,
+  using the user's Pro/Max login (API key stripped from the child env). Tools are described
+  in the system prompt; the reply is structured JSON `{text, tool_calls}`, executed by our
+  own loop. A file-lock semaphore caps parallel calls; usage-limit errors wait for reset.
+- `litellm`: converts to/from OpenAI tool-calling format for any LiteLLM model.
+
+Details for the `anthropic` backend:
 - Prompt caching on (`cache_control` auto) – system prompt, tools and history
   are reused every turn of a task. The system prompt is frozen per task (stored
   in the checkpoint) so the cached prefix stays stable, including across resumes.
